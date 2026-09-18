@@ -37,7 +37,14 @@ const {
   PYTHON_CMD = "python",      // на Windows иногда "py"
   SKIP_DRAFTS = "true",
   CLI_TIMEOUT_MINUTES = "20", // локальная модель может думать долго
+  PR_AGENT_COMMANDS = "describe,review", // команды pr-agent по порядку; например describe,review,improve
 } = env;
+
+const COMMANDS = PR_AGENT_COMMANDS.split(/[,;\s]+/).map((c) => c.trim().replace(/^\//, "")).filter(Boolean);
+if (COMMANDS.length === 0) {
+  console.error("PR_AGENT_COMMANDS пуст — нужна хотя бы одна команда (describe, review, improve...).");
+  process.exit(1);
+}
 
 // ---------- список репозиториев ----------
 // Формат элемента: "owner/repo" или "owner/repo:branch".
@@ -324,12 +331,14 @@ async function processRepo(repo, state) {
 
     console.log(`[${repo.fullName}] PR #${pr.number} «${pr.title}» — новый head ${headSha.slice(0, 7)}`);
 
-    // последовательно: одна GPU — один запрос за раз
-    const okDescribe = await runPrAgent(pr.html_url, "describe");
-    // если describe упал (модель/сеть), review почти наверняка упадёт так же — не жжём GPU
-    const okReview = okDescribe && await runPrAgent(pr.html_url, "review");
+    // команды последовательно (одна GPU — один запрос за раз);
+    // на первом провале останавливаемся — остальные почти наверняка упадут так же
+    let allOk = true;
+    for (const command of COMMANDS) {
+      if (!(await runPrAgent(pr.html_url, command))) { allOk = false; break; }
+    }
 
-    if (okDescribe && okReview) {
+    if (allOk) {
       repoState[pr.number] = headSha;
       saveState(state);
       console.log(`  ✓ ${repo.fullName}#${pr.number} обработан`);
@@ -364,7 +373,7 @@ async function tick() {
 
 async function main() {
   const intervalMs = Number(POLL_MINUTES) * 60_000;
-  console.log(`PR Review Bot запущен, опрос каждые ${POLL_MINUTES} мин. Репозитории:`);
+  console.log(`PR Review Bot запущен, опрос каждые ${POLL_MINUTES} мин, команды: ${COMMANDS.join(" → ")}. Репозитории:`);
   for (const r of REPO_LIST) console.log(`  • ${r.fullName} → ${r.branch}`);
   const localArgs = PR_AGENT_ARGS.slice(BUILTIN_PR_AGENT_ARGS.length);
   if (localArgs.length) {

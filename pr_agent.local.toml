@@ -13,7 +13,7 @@ model = "ollama_chat/gpt-oss:20b"
 fallback_models = ["ollama_chat/gpt-oss:20b"]
 custom_reasoning_model = true   # не слать temperature и т.п. reasoning-модели
 ai_timeout = 1800               # секунд; дефолт pr-agent — 120, локальной модели мало
-# custom_model_max_tokens = 32000
+custom_model_max_tokens = 64000
 
 # [ollama]
 # api_base = "http://localhost:11434"
@@ -26,6 +26,11 @@ extra_instructions = "ЯЗЫК ОТВЕТА: РУССКИЙ. Весь свобо
 
 [pr_description]
 extra_instructions = "ЯЗЫК ОТВЕТА: РУССКИЙ. Описание PR, краткое содержание изменений и построчные описания изменений по файлам (changes summary, changes title) пиши только на русском языке. Заголовок PR не меняй. Не переводи и не меняй: ключи YAML, значение поля type, имена файлов, идентификаторы и фрагменты кода. Ответ на английском считается ошибкой."
+
+[pr_code_suggestions]
+extra_instructions = "ЯЗЫК ОТВЕТА: РУССКИЙ. Заголовок каждого предложения (one_sentence_summary), объяснение (suggestion_content) и обозначение проблемы пиши только на русском языке. Не переводи и не меняй: ключи YAML, значение поля label, имена файлов, а также сам код в existing_code и improved_code. Ответ на английском считается ошибкой."
+parallel_calls = false        # GPU одна — параллельные запросы к Ollama только встанут в очередь
+# suggestions_score_threshold = 7   # показывать только уверенные предложения (0–10), если будет много шума
 
 # Если после этого текст всё равно частично английский — отключить английские примеры в промпте:
 # duplicate_prompt_examples = false   # (в секции [config]; ценой чуть менее стабильного YAML)

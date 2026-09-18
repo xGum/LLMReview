@@ -1,0 +1,37 @@
+# Переименовать в `.pr_agent.toml` и закоммитить в КОРЕНЬ целевого репозитория
+# (в master). pr-agent сам подтянет его из репо при обработке PR
+# (use_repo_settings_file включён по умолчанию).
+
+[config]
+model = "ollama/gpt-oss:20b"
+fallback_models = ["ollama/gpt-oss:20b"]
+custom_model_max_tokens = 131072
+response_language = "ru-RU"        # саммари и ревью на русском
+duplicate_prompt_examples = true   # локальным моделям легче держать JSON-формат
+
+[ollama]
+api_base = "http://localhost:11434"
+
+[pr_description]
+publish_labels = false             # не плодить лейблы, только саммари
+generate_ai_title = false          # не переписывать заголовок PR
+
+[pr_reviewer]
+persistent_comment = true          # обновлять один комментарий, а не плодить новые
+
+[ignore]
+glob = [
+  # картинки и медиа
+  "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.webp",
+  "**/*.svg", "**/*.ico", "**/*.avif",
+  "**/*.mp4", "**/*.webm", "**/*.mp3",
+  # шрифты и бинарники
+  "**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.otf", "**/*.eot",
+  "**/*.wasm", "**/*.zip", "**/*.pdf", "**/*.exe", "**/*.dll",
+  # лок-файлы и артефакты сборки
+  "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
+  "**/dist/**", "**/build/**",
+  # снапшоты тестов
+  "**/*.snap",
+]
+regex = []

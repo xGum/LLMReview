@@ -3,7 +3,7 @@
 // (describe для смердженных PR без саммари).
 
 import { readFileSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ROOT, loadEnv } from "./common.mjs";
 
@@ -186,6 +186,23 @@ function loadLocalPrAgentArgs() {
 // Встроенные аргументы: propagate_tool_errors заставляет свежие версии pr-agent выходить
 // с кодом 1 при провале (старые версии всегда выходят с 0 — для них ниже есть разбор лога).
 export const BUILTIN_PR_AGENT_ARGS = ["--config.propagate_tool_errors=true"];
+
+// Проверка на старте: PYTHON_CMD запускается и в нём установлен pr-agent.
+// Иначе первая же ошибка всплывёт только на первом PR как «spawn python ENOENT».
+export function checkPrAgentInstalled() {
+  const res = spawnSync(PYTHON_CMD, ["-c", "import pr_agent, sys; print(sys.executable)"], { encoding: "utf8" });
+  if (res.error) {
+    console.error(`Не удалось запустить PYTHON_CMD=${PYTHON_CMD}: ${res.error.message}`);
+    console.error("Укажи в .env путь до python с установленным pr-agent, например PYTHON_CMD=/opt/pr-review-bot/.venv/bin/python (Linux) или PYTHON_CMD=py (Windows).");
+    process.exit(1);
+  }
+  if (res.status !== 0) {
+    console.error(`В ${PYTHON_CMD} не найден pr-agent: ${(res.stderr || "").trim().split("\n").pop()}`);
+    console.error("Установи: pip install \"git+https://github.com/qodo-ai/pr-agent.git\" в тот же python, что указан в PYTHON_CMD.");
+    process.exit(1);
+  }
+  console.log(`pr-agent: ${res.stdout.trim()}`);
+}
 export const PR_AGENT_ARGS = [...BUILTIN_PR_AGENT_ARGS, ...loadLocalPrAgentArgs()];
 
 // ---------- pr-agent ----------

@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, loadEnv, parseRepos, githubJson, ymd } from "./common.mjs";
 import { runWeeklySummary, previousFullWeek } from "./weekly-summary.mjs";
-import { runPrAgent, PR_AGENT_ARGS, BUILTIN_PR_AGENT_ARGS, LOCAL_CONFIG_NAME } from "./pr-agent.mjs";
+import { runPrAgent, PR_AGENT_ARGS, BUILTIN_PR_AGENT_ARGS, LOCAL_CONFIG_NAME, checkPrAgentInstalled } from "./pr-agent.mjs";
 
 const STATE_FILE = join(ROOT, "state.json");
 
@@ -270,6 +270,7 @@ async function maybeRunWeeklySummary(state) {
 
 async function main() {
   const intervalMs = Number(POLL_MINUTES) * 60_000;
+  checkPrAgentInstalled();
   console.log(`PR Review Bot запущен, опрос каждые ${POLL_MINUTES} мин, команды: ${COMMANDS.join(" → ")}. Репозитории:`);
   if (AUTO_APPROVE === "true") {
     console.log(`Автоапрув: включён (ревью без замечаний${Number(AUTO_APPROVE_MAX_EFFORT) > 0 ? `, усилия ≤ ${AUTO_APPROVE_MAX_EFFORT}/5` : ""}).`);

@@ -1,0 +1,38 @@
+# systemd-юнит PR Review Bot. Установка: см. DEPLOY.md
+# Путь установки и пользователь ниже — /opt/pr-review-bot и prbot; при другом раскладе поправить.
+
+[Unit]
+Description=PR Review Bot (pr-agent poller + weekly digest)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prbot
+Group=prbot
+WorkingDirectory=/opt/pr-review-bot
+ExecStart=/usr/bin/node /opt/pr-review-bot/poller.mjs
+
+# Часовой пояс — от него зависит, когда стартует недельный дайджест (WEEKLY_SUMMARY_DAY/HOUR)
+Environment=TZ=Europe/Istanbul
+Environment=NODE_ENV=production
+Environment=PYTHONUNBUFFERED=1
+
+# Перезапуск при любом падении; systemd сам не даст уйти в бесконечный цикл рестартов
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=0
+
+# Корректное завершение: поллер дожидается текущего pr-agent не дольше 3 минут
+KillSignal=SIGTERM
+TimeoutStopSec=180
+
+# Немного изоляции: файловая система только для чтения, кроме папки бота
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/pr-review-bot
+
+[Install]
+WantedBy=multi-user.target

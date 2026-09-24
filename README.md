@@ -230,6 +230,11 @@ node weekly-summary.mjs --no-describe                # не догенериро
 про модель). Тон, эмодзи и структуру текста задают `SYSTEM_PROMPT`
 (дайджест по репозиторию) и `OVERVIEW_SYSTEM_PROMPT` («Главное за неделю») в `weekly-summary.mjs`.
 
+## Развёртывание на сервере
+
+Пошагово — в [DEPLOY.md](DEPLOY.md): Ubuntu, Node 22, pr-agent в venv, systemd-юнит из
+`deploy/pr-review-bot.service` с автостартом и перезапуском при падении, логи в journald.
+
 ## Автозапуск (Windows)
 
 Планировщик задач → «При входе в систему» → запуск

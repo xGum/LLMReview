@@ -1,31 +1,16 @@
 // PR Review Bot — локальный поллер
 // Следит за открытыми PR в базовую ветку в нескольких репозиториях,
-// при новых коммитах запускает pr-agent (describe + review) через локальную LLM (Ollama).
+// при новых коммитах запускает pr-agent (describe + review [+ improve]) через локальную LLM (Ollama).
+// Раз в неделю собирает релиз-дайджест для бизнеса (см. weekly-summary.mjs).
 // Node 18+, без зависимостей.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { ROOT, loadEnv, parseRepos, githubJson, ymd } from "./common.mjs";
+import { runWeeklySummary, previousFullWeek } from "./weekly-summary.mjs";
+import { runPrAgent, PR_AGENT_ARGS, BUILTIN_PR_AGENT_ARGS, LOCAL_CONFIG_NAME } from "./pr-agent.mjs";
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = join(ROOT, "state.json");
-const LOCAL_CONFIG_FILE = join(ROOT, "pr_agent.local.toml");
-
-// ---------- .env ----------
-function loadEnv() {
-  const file = join(ROOT, ".env");
-  if (!existsSync(file)) {
-    console.error("Нет файла .env — скопируй .env.example в .env и заполни.");
-    process.exit(1);
-  }
-  const env = {};
-  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (m && !line.trim().startsWith("#")) env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-  }
-  return env;
-}
 
 const env = loadEnv();
 const {
@@ -34,10 +19,14 @@ const {
   REPO,                       // старый формат: один "owner/repo" (для совместимости)
   BASE_BRANCH = "master",     // ветка по умолчанию, если у репо не указана своя
   POLL_MINUTES = "5",
-  PYTHON_CMD = "python",      // на Windows иногда "py"
   SKIP_DRAFTS = "true",
-  CLI_TIMEOUT_MINUTES = "20", // локальная модель может думать долго
   PR_AGENT_COMMANDS = "describe,review", // команды pr-agent по порядку; например describe,review,improve
+  WEEKLY_SUMMARY = "true",          // собирать релиз-дайджест раз в неделю
+  WEEKLY_SUMMARY_DAY = "1",         // день недели: 1 = понедельник … 7 = воскресенье
+  WEEKLY_SUMMARY_HOUR = "9",        // начиная с какого часа (локальное время)
+  WEEKLY_SUMMARY_MAX_ATTEMPTS = "3", // после стольких неудач собрать дайджест даже без саммари у части PR
+  AUTO_APPROVE = "false",           // ставить предварительный approve, если ревью без замечаний
+  AUTO_APPROVE_MAX_EFFORT = "3",    // и оценка усилий на ревью не выше этой (1–5); 0 — не учитывать
 } = env;
 
 const COMMANDS = PR_AGENT_COMMANDS.split(/[,;\s]+/).map((c) => c.trim().replace(/^\//, "")).filter(Boolean);
@@ -46,168 +35,12 @@ if (COMMANDS.length === 0) {
   process.exit(1);
 }
 
-// ---------- список репозиториев ----------
-// Формат элемента: "owner/repo" или "owner/repo:branch".
-// Разделители — запятая, точка с запятой или перенос строки.
-function parseRepos(raw) {
-  const repos = [];
-  for (const item of (raw ?? "").split(/[,;\n]/)) {
-    const s = item.trim();
-    if (!s) continue;
-    const [fullName, branch] = s.split(":");
-    if (!/^[\w.-]+\/[\w.-]+$/.test(fullName)) {
-      console.error(`Некорректный репозиторий в .env: «${s}» (ожидается owner/repo или owner/repo:branch)`);
-      process.exit(1);
-    }
-    repos.push({ fullName, branch: (branch || BASE_BRANCH).trim() });
-  }
-  // убираем дубли
-  const seen = new Set();
-  return repos.filter((r) => !seen.has(r.fullName) && seen.add(r.fullName));
-}
-
-const REPO_LIST = parseRepos(REPOS || REPO);
+const REPO_LIST = parseRepos(REPOS || REPO, BASE_BRANCH);
 
 if (!GITHUB_TOKEN || REPO_LIST.length === 0) {
   console.error("В .env обязательны GITHUB_TOKEN и REPOS (список owner/repo через запятую).");
   process.exit(1);
 }
-
-// ---------- локальный конфиг pr-agent ----------
-// pr_agent.local.toml перекрывает .pr_agent.toml из репозитория: pr-agent применяет
-// CLI-аргументы `--section.key=value` ПОСЛЕ репозиторного файла, поэтому каждый ключ
-// локального файла передаётся как аргумент. Значение кодируется в JSON — pr-agent
-// парсит его как YAML, а JSON является валидным YAML.
-//
-// Поддерживаемое подмножество TOML: [секции], key = "строка" | 'строка' | число |
-// true/false | [массив, в т.ч. многострочный], комментарии через #.
-
-function stripTomlComment(line) {
-  let quote = null;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quote) {
-      if (ch === "\\" && quote === '"') i++;      // экранирование в basic-строке
-      else if (ch === quote) quote = null;
-    } else if (ch === '"' || ch === "'") quote = ch;
-    else if (ch === "#") return line.slice(0, i);
-  }
-  return line;
-}
-
-function bracketBalance(text) {
-  let depth = 0, quote = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === "\\" && quote === '"') i++;
-      else if (ch === quote) quote = null;
-    } else if (ch === '"' || ch === "'") quote = ch;
-    else if (ch === "[") depth++;
-    else if (ch === "]") depth--;
-  }
-  return depth;
-}
-
-function splitTopLevel(text) {
-  const parts = [];
-  let depth = 0, quote = null, cur = "";
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      cur += ch;
-      if (ch === "\\" && quote === '"') cur += text[++i];
-      else if (ch === quote) quote = null;
-    } else if (ch === '"' || ch === "'") { quote = ch; cur += ch; }
-    else if (ch === "[") { depth++; cur += ch; }
-    else if (ch === "]") { depth--; cur += ch; }
-    else if (ch === "," && depth === 0) { parts.push(cur); cur = ""; }
-    else cur += ch;
-  }
-  if (cur.trim()) parts.push(cur);
-  return parts.map((p) => p.trim()).filter(Boolean);
-}
-
-function parseTomlValue(text, where) {
-  const s = text.trim();
-  if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) return JSON.parse(s);
-  if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) return s.slice(1, -1);
-  if (s === "true") return true;
-  if (s === "false") return false;
-  if (/^[+-]?\d+(\.\d+)?$/.test(s)) return Number(s);
-  if (s.startsWith("[") && s.endsWith("]")) {
-    return splitTopLevel(s.slice(1, -1)).map((item) => parseTomlValue(item, where));
-  }
-  throw new Error(`${where}: не могу разобрать значение «${s}» (поддерживаются строки в кавычках, числа, true/false, массивы)`);
-}
-
-function parseTomlSubset(text, fileName) {
-  const result = {};
-  let section = null;
-  let pending = null; // накопитель многострочного массива
-  const lines = text.split(/\r?\n/);
-
-  for (let n = 0; n < lines.length; n++) {
-    const where = `${fileName}:${n + 1}`;
-    let line = stripTomlComment(lines[n]).trim();
-
-    if (pending) {
-      pending.text += " " + line;
-      if (bracketBalance(pending.text) > 0) continue;
-      result[section][pending.key] = parseTomlValue(pending.text, where);
-      pending = null;
-      continue;
-    }
-    if (!line) continue;
-
-    const sec = line.match(/^\[([^\]]+)\]$/);
-    if (sec) {
-      section = sec[1].trim();
-      result[section] ??= {};
-      continue;
-    }
-
-    const kv = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
-    if (!kv) throw new Error(`${where}: не понимаю строку «${line}»`);
-    if (!section) throw new Error(`${where}: ключ «${kv[1]}» вне секции — в pr-agent все ключи живут в [секциях]`);
-
-    const [, key, valueText] = kv;
-    if (valueText.startsWith("[") && bracketBalance(valueText) > 0) {
-      pending = { key, text: valueText };
-      continue;
-    }
-    result[section][key] = parseTomlValue(valueText, where);
-  }
-  if (pending) throw new Error(`${fileName}: незакрытый массив у ключа «${pending.key}»`);
-  return result;
-}
-
-function loadLocalPrAgentArgs() {
-  if (!existsSync(LOCAL_CONFIG_FILE)) return [];
-  let config;
-  try {
-    config = parseTomlSubset(readFileSync(LOCAL_CONFIG_FILE, "utf8"), "pr_agent.local.toml");
-  } catch (err) {
-    console.error(`Ошибка в pr_agent.local.toml: ${err.message}`);
-    process.exit(1);
-  }
-  const args = [];
-  for (const [section, keys] of Object.entries(config)) {
-    for (const [key, value] of Object.entries(keys)) {
-      // Dynaconf 3.3 (в pr-agent до 15.09.2026) при set() ДОПИСЫВАЕТ списки к существующим,
-      // а не заменяет. Поэтому список сначала удаляем через @del, потом ставим заново —
-      // работает и на старом, и на новом Dynaconf, остальные ключи секции не трогает.
-      if (Array.isArray(value)) args.push(`--${section}.${key}=@del`);
-      args.push(`--${section}.${key}=${JSON.stringify(value)}`);
-    }
-  }
-  return args;
-}
-
-// Встроенные аргументы: propagate_tool_errors заставляет свежие версии pr-agent выходить
-// с кодом 1 при провале (старые версии всегда выходят с 0 — для них ниже есть разбор лога).
-const BUILTIN_PR_AGENT_ARGS = ["--config.propagate_tool_errors=true"];
-const PR_AGENT_ARGS = [...BUILTIN_PR_AGENT_ARGS, ...loadLocalPrAgentArgs()];
 
 // ---------- state ----------
 // Формат: { "owner/repo": { "<номер PR>": "<head sha>" } }
@@ -217,7 +50,7 @@ function loadState() {
   if (!state || typeof state !== "object") return {};
 
   // миграция старого плоского формата { "<номер PR>": "<sha>" } → привязываем к первому репо
-  const values = Object.values(state);
+  const values = Object.entries(state).filter(([k]) => !k.startsWith("_")).map(([, v]) => v);
   if (values.length && values.every((v) => typeof v === "string")) {
     console.log(`state.json в старом формате — переношу под ${REPO_LIST[0].fullName}`);
     return { [REPO_LIST[0].fullName]: state };
@@ -229,85 +62,11 @@ function saveState(state) {
 }
 
 // ---------- GitHub API ----------
-async function listOpenPRs(repo) {
-  const res = await fetch(
-    `https://api.github.com/repos/${repo.fullName}/pulls?base=${encodeURIComponent(repo.branch)}&state=open&per_page=50`,
-    {
-      headers: {
-        Authorization: `Bearer ${GITHUB_TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    },
+function listOpenPRs(repo) {
+  return githubJson(
+    `/repos/${repo.fullName}/pulls?base=${encodeURIComponent(repo.branch)}&state=open&per_page=50`,
+    GITHUB_TOKEN,
   );
-  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-// ---------- pr-agent ----------
-// pr-agent CLI (кроме самых свежих версий с propagate_tool_errors) при провале печатает
-// help и выходит с кодом 0, поэтому успех определяем ещё и по маркерам в логе.
-const PR_AGENT_FAILURE_MARKERS = [
-  /Failed to process the command/,
-  /Failed to generate prediction with any model/,
-  /Failed to review PR/,
-  /Error generating PR description/,
-  /Traceback \(most recent call last\)/,
-];
-
-function runPrAgent(prUrl, command) {
-  return new Promise((resolve) => {
-    const args = ["-m", "pr_agent.cli", `--pr_url=${prUrl}`, command, ...PR_AGENT_ARGS];
-    console.log(`  → ${PYTHON_CMD} -m pr_agent.cli --pr_url=${prUrl} ${command}` +
-      (PR_AGENT_ARGS.length ? ` (+${PR_AGENT_ARGS.length} переопределений)` : ""));
-
-    const child = spawn(PYTHON_CMD, args, {
-      cwd: ROOT,
-      env: {
-        ...process.env,
-        GITHUB__USER_TOKEN: GITHUB_TOKEN, // токен для pr-agent
-        PYTHONIOENCODING: "utf-8",        // кириллица в консоли Windows
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let failureSeen = null;
-    const watch = (stream, out) => {
-      stream.setEncoding("utf8");
-      stream.on("data", (chunk) => {
-        out.write(chunk);
-        if (!failureSeen) {
-          const m = PR_AGENT_FAILURE_MARKERS.find((re) => re.test(chunk));
-          if (m) failureSeen = m.source;
-        }
-      });
-    };
-    watch(child.stdout, process.stdout);
-    watch(child.stderr, process.stderr);
-
-    const timeout = setTimeout(() => {
-      console.error(`  ✗ ${command}: таймаут ${CLI_TIMEOUT_MINUTES} мин, убиваю процесс`);
-      child.kill();
-    }, Number(CLI_TIMEOUT_MINUTES) * 60_000);
-
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        console.error(`  ✗ ${command}: pr-agent завершился с кодом ${code}`);
-        return resolve(false);
-      }
-      if (failureSeen) {
-        console.error(`  ✗ ${command}: в логе pr-agent есть признак провала (${failureSeen})`);
-        return resolve(false);
-      }
-      resolve(true);
-    });
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      console.error(`  ✗ не удалось запустить ${PYTHON_CMD}: ${err.message}`);
-      resolve(false);
-    });
-  });
 }
 
 // ---------- обработка одного репозитория ----------
@@ -342,6 +101,10 @@ async function processRepo(repo, state) {
       repoState[pr.number] = headSha;
       saveState(state);
       console.log(`  ✓ ${repo.fullName}#${pr.number} обработан`);
+      if (AUTO_APPROVE === "true" && COMMANDS.includes("review")) {
+        try { await autoApprove(repo, pr); }
+        catch (err) { console.error(`  ✗ автоапрув ${repo.fullName}#${pr.number}: ${err.message}`); }
+      }
     } else {
       console.error(`  ✗ ${repo.fullName}#${pr.number}: не всё прошло, попробую в следующем цикле`);
     }
@@ -351,6 +114,96 @@ async function processRepo(repo, state) {
   const openNumbers = new Set(prs.map((p) => String(p.number)));
   for (const key of Object.keys(repoState)) {
     if (!openNumbers.has(key)) delete repoState[key];
+  }
+}
+
+// ---------- предварительный апрув ----------
+// Читаем персистентный комментарий ревью pr-agent («PR Reviewer Guide») и смотрим на его
+// статические маркеры (они на английском независимо от языка ответов модели):
+//   «No major issues detected»          — ключевых проблем нет
+//   «No security concerns identified»   — замечаний по безопасности нет
+//   «Merge recommendation: Safe to merge» — если включён require_merge_recommendation
+//   «Estimated effort to review: N»      — оценка усилий 1–5
+// Всё чисто → ставим approve от имени владельца токена. Ревью нашло проблемы → снимаем
+// наш прошлый approve (если был). Апрув на тот же head SHA повторно не ставим.
+
+const REVIEW_HEADING = "PR Reviewer Guide";
+const APPROVE_MARKER = "<!-- pr-review-bot:auto-approve -->";
+let botLogin = null;
+
+function parseReviewVerdict(body) {
+  const effort = body.match(/Estimated effort to review[^:]*:\s*(\d)/i);
+  const rec = body.match(/Merge recommendation[^:]*:\s*([A-Za-z ]+)/i);
+  return {
+    noIssues: /No major issues detected/i.test(body),
+    securityOk: /No security concerns identified/i.test(body),
+    effort: effort ? Number(effort[1]) : null,
+    mergeRecommendation: rec ? rec[1].trim().toLowerCase().replace(/\s+/g, "_") : null, // safe_to_merge | merge_with_caution | changes_required
+  };
+}
+
+async function findReviewComment(repo, pr) {
+  const comments = await githubJson(`/repos/${repo.fullName}/issues/${pr.number}/comments?per_page=100`, GITHUB_TOKEN);
+  const reviews = comments.filter((c) => (c.body ?? "").includes(REVIEW_HEADING));
+  reviews.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+  return reviews[0] ?? null;
+}
+
+async function autoApprove(repo, pr) {
+  const tag = `${repo.fullName}#${pr.number}`;
+  const comment = await findReviewComment(repo, pr);
+  if (!comment) { console.log(`  · автоапрув ${tag}: комментарий ревью не найден, пропускаю`); return; }
+
+  const v = parseReviewVerdict(comment.body);
+  const maxEffort = Number(AUTO_APPROVE_MAX_EFFORT);
+  const reasons = [];
+  if (!v.noIssues) reasons.push("есть ключевые проблемы");
+  if (!v.securityOk) reasons.push("есть замечания по безопасности");
+  if (v.mergeRecommendation && v.mergeRecommendation !== "safe_to_merge") reasons.push(`рекомендация: ${v.mergeRecommendation}`);
+  if (maxEffort > 0 && v.effort != null && v.effort > maxEffort) reasons.push(`оценка усилий ${v.effort} > ${maxEffort}`);
+  const clean = reasons.length === 0;
+
+  botLogin ??= (await githubJson("/user", GITHUB_TOKEN)).login;
+  const reviews = await githubJson(`/repos/${repo.fullName}/pulls/${pr.number}/reviews?per_page=100`, GITHUB_TOKEN);
+  const ourApprovals = reviews.filter((r) => r.user?.login === botLogin && r.state === "APPROVED");
+
+  if (!clean) {
+    console.log(`  · автоапрув ${tag}: не ставлю (${reasons.join(", ")})`);
+    for (const r of ourApprovals) {
+      await githubJson(`/repos/${repo.fullName}/pulls/${pr.number}/reviews/${r.id}/dismissals`, GITHUB_TOKEN, {
+        method: "PUT",
+        body: { message: `Предварительный апрув снят: новое автоматическое ревью нашло замечания (${reasons.join(", ")}).` },
+      });
+      console.log(`  ↩ автоапрув ${tag}: снял прошлый approve`);
+    }
+    return;
+  }
+
+  if (ourApprovals.some((r) => r.commit_id === pr.head.sha)) {
+    console.log(`  · автоапрув ${tag}: approve на этот коммит уже стоит`);
+    return;
+  }
+  const details = [
+    "ключевых проблем нет",
+    "замечаний по безопасности нет",
+    v.effort != null ? `оценка усилий на ревью — ${v.effort}/5` : null,
+    v.mergeRecommendation ? "рекомендация модели — safe to merge" : null,
+  ].filter(Boolean).join(", ");
+  try {
+    await githubJson(`/repos/${repo.fullName}/pulls/${pr.number}/reviews`, GITHUB_TOKEN, {
+      method: "POST",
+      body: {
+        event: "APPROVE",
+        body: `${APPROVE_MARKER}\n✅ **Предварительный апрув от бота**\n\nАвтоматическое ревью не нашло замечаний: ${details}.\n\n_Это не заменяет ревью человека. Апрув снимается автоматически, если следующее ревью найдёт проблемы._`,
+      },
+    });
+    console.log(`  ✅ автоапрув ${tag}: approve поставлен`);
+  } catch (err) {
+    if (err.status === 422 && /own pull request/i.test(err.message)) {
+      console.log(`  · автоапрув ${tag}: GitHub не даёт апрувить собственный PR (автор — владелец токена)`);
+      return;
+    }
+    throw err;
   }
 }
 
@@ -366,21 +219,72 @@ async function tick() {
   // чистим состояние репозиториев, которых больше нет в списке
   const tracked = new Set(REPO_LIST.map((r) => r.fullName));
   for (const key of Object.keys(state)) {
-    if (!tracked.has(key)) delete state[key];
+    if (!key.startsWith("_") && !tracked.has(key)) delete state[key];
   }
   saveState(state);
+
+  await maybeRunWeeklySummary(state);
+}
+
+// ---------- еженедельный дайджест ----------
+// Запускается один раз за неделю: в день WEEKLY_SUMMARY_DAY, начиная с часа WEEKLY_SUMMARY_HOUR,
+// за прошлую полную неделю (пн–вс). Факт запуска хранится в state.json → _meta.lastWeeklySummary.
+// Если бот был выключен в назначенный день, дайджест соберётся при первом же тике позже на той же неделе.
+async function maybeRunWeeklySummary(state) {
+  if (WEEKLY_SUMMARY !== "true") return;
+  const now = new Date();
+  const dow = ((now.getDay() + 6) % 7) + 1; // 1 = пн … 7 = вс
+  if (dow < Number(WEEKLY_SUMMARY_DAY)) return;
+  if (dow === Number(WEEKLY_SUMMARY_DAY) && now.getHours() < Number(WEEKLY_SUMMARY_HOUR)) return;
+
+  const period = previousFullWeek(now);
+  const key = ymd(period.from);
+  const meta = (state._meta ??= {});
+  if (meta.lastWeeklySummary === key) return;
+
+  // счётчик неудачных попыток за эту неделю: если саммари для каких-то PR так и не получается
+  // сгенерировать (или GitHub/Ollama недоступны), после MAX_ATTEMPTS собираем дайджест без них
+  meta.weeklyAttempts ??= {};
+  const attempts = meta.weeklyAttempts[key] ?? 0;
+  const allowMissing = attempts >= Number(WEEKLY_SUMMARY_MAX_ATTEMPTS);
+
+  console.log(`Пора собирать недельный дайджест за неделю с ${key}` +
+    (allowMissing ? ` (попытка ${attempts + 1}, PR без саммари войдут как есть)` : ` (попытка ${attempts + 1})`));
+  try {
+    const result = await runWeeklySummary({ period, allowMissing });
+    if (!result.ok) {
+      meta.weeklyAttempts[key] = attempts + 1;
+      saveState(state);
+      console.error(`  ✗ дайджест не собран: ${result.reason}; попробую в следующем цикле`);
+      return;
+    }
+    meta.lastWeeklySummary = key;
+    delete meta.weeklyAttempts[key];
+    saveState(state);
+  } catch (err) {
+    meta.weeklyAttempts[key] = attempts + 1;
+    saveState(state);
+    console.error(`  ✗ дайджест не собран: ${err.message}; попробую в следующем цикле`);
+  }
 }
 
 async function main() {
   const intervalMs = Number(POLL_MINUTES) * 60_000;
   console.log(`PR Review Bot запущен, опрос каждые ${POLL_MINUTES} мин, команды: ${COMMANDS.join(" → ")}. Репозитории:`);
+  if (AUTO_APPROVE === "true") {
+    console.log(`Автоапрув: включён (ревью без замечаний${Number(AUTO_APPROVE_MAX_EFFORT) > 0 ? `, усилия ≤ ${AUTO_APPROVE_MAX_EFFORT}/5` : ""}).`);
+  }
+  if (WEEKLY_SUMMARY === "true") {
+    const days = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+    console.log(`Недельный дайджест: ${days[Number(WEEKLY_SUMMARY_DAY) - 1] ?? "?"} после ${WEEKLY_SUMMARY_HOUR}:00 за прошлую неделю (ручной запуск: npm run summary).`);
+  }
   for (const r of REPO_LIST) console.log(`  • ${r.fullName} → ${r.branch}`);
   const localArgs = PR_AGENT_ARGS.slice(BUILTIN_PR_AGENT_ARGS.length);
   if (localArgs.length) {
-    console.log(`Локальные переопределения pr-agent (pr_agent.local.toml), перекрывают .pr_agent.toml из репо:`);
+    console.log(`Локальные переопределения pr-agent (${LOCAL_CONFIG_NAME}), перекрывают .pr_agent.toml из репо:`);
     for (const a of localArgs) console.log(`  ${a}`);
   } else {
-    console.log(`pr_agent.local.toml не найден — используется только .pr_agent.toml из репозиториев.`);
+    console.log(`${LOCAL_CONFIG_NAME} не найден — используется только .pr_agent.toml из репозиториев.`);
   }
   for (;;) {
     await tick();

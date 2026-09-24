@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node poller.mjs"
+    "start": "node poller.mjs",
+    "summary": "node weekly-summary.mjs"
   }
 }

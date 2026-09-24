@@ -116,7 +116,24 @@ sudo systemctl disable --now pr-review-bot   # убрать из автоста�
 cd /opt/pr-review-bot && sudo -u prbot node weekly-summary.mjs --days 7
 ```
 
-## 6. Обновление кода
+## 6. Ежедневные команды (npm-скрипты)
+
+Из `/opt/pr-review-bot` (нужен `sudo` для restart — запускать под пользователем с правами, не под `prbot`):
+
+| Команда | Что делает |
+|---|---|
+| `npm run status` | статус сервиса: активен ли, время работы, последние строки лога |
+| `npm run logs` | лог в реальном времени (последние 100 строк + хвост), выход Ctrl+C |
+| `npm run logs:today` | лог за сегодня |
+| `npm run logs:errors` | только ошибки за 7 дней |
+| `npm run restart` | перезапуск сервиса (после правки `.env` или `pr_agent.local.*.toml`) и статус |
+| `npm run deploy` | `git pull` + перезапуск + статус — после обновления кода |
+| `npm run deploy:full` | то же плюс обновление pr-agent из GitHub |
+
+`npm run start` и `npm run summary` — как и раньше, прямой запуск поллера/дайджеста (на сервере
+поллер запускает systemd, руками его стартовать не нужно; дайджест — `sudo -u prbot npm run summary -- --days 7`).
+
+## 7. Обновление кода
 
 ```bash
 cd /opt/pr-review-bot
@@ -131,7 +148,7 @@ sudo -u prbot /opt/pr-review-bot/.venv/bin/pip install --upgrade "git+https://gi
 sudo systemctl restart pr-review-bot
 ```
 
-## 7. Где лежат дайджесты
+## 8. Где лежат дайджесты
 
 `/opt/pr-review-bot/release-notes/<период>/` — папка на сервере. Забрать на свою машину:
 

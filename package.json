@@ -8,6 +8,13 @@
   },
   "scripts": {
     "start": "node poller.mjs",
-    "summary": "node weekly-summary.mjs"
+    "summary": "node weekly-summary.mjs",
+    "status": "systemctl status pr-review-bot --no-pager -l",
+    "logs": "journalctl -u pr-review-bot -f -n 100",
+    "logs:today": "journalctl -u pr-review-bot --since today --no-pager",
+    "logs:errors": "journalctl -u pr-review-bot -p err --since '7 days ago' --no-pager",
+    "restart": "sudo systemctl restart pr-review-bot && sleep 2 && systemctl status pr-review-bot --no-pager -l | head -12",
+    "deploy": "git pull --ff-only && sudo systemctl restart pr-review-bot && sleep 2 && systemctl status pr-review-bot --no-pager -l | head -12",
+    "deploy:full": "git pull --ff-only && .venv/bin/pip install --upgrade \"git+https://github.com/qodo-ai/pr-agent.git\" && sudo systemctl restart pr-review-bot && sleep 2 && systemctl status pr-review-bot --no-pager -l | head -12"
   }
 }

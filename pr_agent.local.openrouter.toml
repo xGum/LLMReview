@@ -11,6 +11,9 @@
 model = "openrouter/z-ai/glm-5.3-flash"
 fallback_models = ["openrouter/z-ai/glm-5.3-flash"]
 custom_model_max_tokens = 120000
+# Общий потолок pr-agent для ЛЮБОЙ модели (по умолчанию 32000) — без него в лог пишется
+# «total tokens over limit: 32000» и дифф режется, сколько бы ни стояло в custom_model_max_tokens.
+max_model_tokens = 120000
 # Прошлый вариант, если захочется сравнить:
 # model = "openrouter/openai/gpt-oss-120b"
 # fallback_models = ["openrouter/openai/gpt-oss-120b"]

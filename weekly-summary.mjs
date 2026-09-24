@@ -23,7 +23,7 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
-import { ROOT, loadEnv, parseRepos, githubJson, ymd, isoLocal, pad2 } from "./common.mjs";
+import { ROOT, loadEnv, parseRepos, githubJson, ymd, pad2 } from "./common.mjs";
 import { runPrAgent } from "./pr-agent.mjs";
 
 const env = loadEnv();
@@ -92,25 +92,36 @@ function humanPeriod({ from, to }) {
 }
 
 // ---------- GitHub: смердженные PR за период ----------
+// Берём закрытые PR репозитория (свежие сверху) и фильтруем по merged_at и базовой ветке.
+// Search API специально не используем: его индекс обновляется с задержкой (на приватных
+// репозиториях — иногда заметной), а у списка PR такой проблемы нет.
 async function fetchMergedPRs(repo, { from, to }) {
-  const toInclusive = new Date(to.getTime() - 1000);
-  const q = `repo:${repo.fullName} is:pr is:merged base:${repo.branch} merged:${isoLocal(from)}..${isoLocal(toInclusive)}`;
   const items = [];
-  for (let page = 1; page <= 5; page++) {
-    const data = await githubJson(`/search/issues?q=${encodeURIComponent(q)}&sort=updated&order=asc&per_page=100&page=${page}`, GITHUB_TOKEN);
-    items.push(...data.items);
-    if (items.length >= data.total_count || data.items.length === 0) break;
+  for (let page = 1; page <= 10; page++) {
+    const batch = await githubJson(
+      `/repos/${repo.fullName}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`,
+      GITHUB_TOKEN,
+    );
+    if (!batch.length) break;
+    items.push(...batch);
+    // список отсортирован по updated_at; у смердженного в окне PR updated_at >= merged_at >= from,
+    // значит, как только пошли PR, обновлённые раньше начала периода, дальше искать нечего
+    if (new Date(batch[batch.length - 1].updated_at) < from) break;
   }
-  return items.map((it) => ({
-    number: it.number,
-    title: it.title,
-    url: it.html_url,
-    author: it.user?.login ?? "?",
-    mergedAt: it.pull_request?.merged_at ? new Date(it.pull_request.merged_at) : null,
-    labels: (it.labels ?? []).map((l) => l.name),
-    body: cleanPrBody(it.body),
-    hasSummary: hasPrAgentSummary(it.body),
-  })).sort((a, b) => (a.mergedAt?.getTime() ?? 0) - (b.mergedAt?.getTime() ?? 0));
+  return items
+    .filter((pr) => pr.merged_at && pr.base?.ref === repo.branch)
+    .filter((pr) => { const m = new Date(pr.merged_at); return m >= from && m < to; })
+    .map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      url: pr.html_url,
+      author: pr.user?.login ?? "?",
+      mergedAt: new Date(pr.merged_at),
+      labels: (pr.labels ?? []).map((l) => l.name),
+      body: cleanPrBody(pr.body),
+      hasSummary: hasPrAgentSummary(pr.body),
+    }))
+    .sort((a, b) => a.mergedAt - b.mergedAt);
 }
 
 // Саммари от pr-agent describe определяем так же, как сам pr-agent (_is_generated_by_pr_agent):
@@ -410,6 +421,11 @@ export async function runWeeklySummary({
       problems.push(`${repo.fullName}: ${err.message}`);
       console.error(`[дайджест] ${repo.fullName}: ✗ ${err.message}`);
     }
+  }
+
+  if (!dryRun && sections.every((s) => s.prs.length === 0 && !s.error)) {
+    log("за период ни в одном репозитории нет смердженных PR. По умолчанию берётся прошлая полная " +
+        "неделя (пн–вс); для текущей недели или другого периода — --days N либо --from/--to.");
   }
 
   if (problems.length) {

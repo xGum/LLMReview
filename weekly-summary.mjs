@@ -42,6 +42,7 @@ const {
   SUMMARY_THINK = "low",              // глубина рассуждений gpt-oss: low/medium/high; "" — не передавать
   SUMMARY_TIMEOUT_MINUTES = "30",
   RELEASE_NOTES_DIR = "release-notes",
+  DIGEST_IGNORE_GLOBS = "",           // доп. глобы «не код» через запятую, сверх встроенного списка
 } = env;
 
 const MODEL = SUMMARY_MODEL || (SUMMARY_PROVIDER === "openrouter" ? "z-ai/glm-5.3-flash" : "gpt-oss:20b");
@@ -141,11 +142,79 @@ export function hasPrAgentSummary(body) {
   return PR_AGENT_MARKERS.some((m) => low.includes(m));
 }
 
+// ---------- PR без кода ----------
+// Если PR меняет только файлы, которые pr-agent игнорирует (документы, картинки, шрифты,
+// лок-файлы, сборка), describe ничего не опубликует — диффа для модели нет. Такие PR саммари
+// не требуют: в дайджест уходит список файлов и что с ними сделали.
+// Список повторяет [ignore] из pr_agent.toml.example; расширяется через DIGEST_IGNORE_GLOBS.
+const BUILTIN_IGNORE_GLOBS = [
+  "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.webp", "**/*.svg", "**/*.ico", "**/*.avif",
+  "**/*.mp4", "**/*.webm", "**/*.mp3",
+  "**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.otf", "**/*.eot",
+  "**/*.wasm", "**/*.zip", "**/*.pdf", "**/*.exe", "**/*.dll",
+  "**/*.doc", "**/*.docx", "**/*.xls", "**/*.xlsx", "**/*.ppt", "**/*.pptx",
+  "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
+  "**/dist/**", "**/build/**",
+  "**/*.snap",
+];
+const IGNORE_RES = [...BUILTIN_IGNORE_GLOBS, ...DIGEST_IGNORE_GLOBS.split(",").map((g) => g.trim()).filter(Boolean)]
+  .map(globToRegExp);
+
+function globToRegExp(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") {
+      if (glob[i + 1] === "*") {
+        i++;
+        if (glob[i + 1] === "/") { i++; re += "(?:.*/)?"; } else re += ".*";
+      } else re += "[^/]*";
+    } else if (ch === "?") re += "[^/]";
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`, "i");
+}
+
+export function isIgnoredPath(path) {
+  return IGNORE_RES.some((re) => re.test(path));
+}
+
+const FILE_STATUS_RU = { added: "добавлен", modified: "изменён", removed: "удалён", renamed: "переименован", copied: "скопирован" };
+
+async function fetchChangedFiles(repo, pr) {
+  const files = [];
+  for (let page = 1; page <= 3; page++) {
+    const batch = await githubJson(`/repos/${repo.fullName}/pulls/${pr.number}/files?per_page=100&page=${page}`, GITHUB_TOKEN);
+    files.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return files.map((f) => ({ path: f.filename, status: f.status, previous: f.previous_filename }));
+}
+
 // Догенерировать саммари для PR без него: pr-agent describe → перечитать тело PR.
 async function ensureSummaries(repo, prs, { dryRun, describe }) {
-  const missing = prs.filter((pr) => !pr.hasSummary);
-  if (!missing.length) return [];
+  const noSummary = prs.filter((pr) => !pr.hasSummary);
+  if (!noSummary.length) return [];
   const log = (m) => console.log(`[дайджест] ${repo.fullName}: ${m}`);
+
+  // PR, где все файлы попадают под игнор, саммари не требуют
+  const missing = [];
+  for (const pr of noSummary) {
+    try {
+      const files = await fetchChangedFiles(repo, pr);
+      if (files.length && files.every((f) => isIgnoredPath(f.path) && (!f.previous || isIgnoredPath(f.previous)))) {
+        pr.noCode = true;
+        pr.changedFiles = files;
+        log(`#${pr.number} «${pr.title}» — без кода (${files.length} файл(ов): ${files.slice(0, 3).map((f) => f.path.split("/").pop()).join(", ")}${files.length > 3 ? "…" : ""}), саммари не нужно`);
+        continue;
+      }
+    } catch (err) {
+      console.error(`[дайджест] ${repo.fullName}: не удалось получить файлы #${pr.number}: ${err.message}`);
+    }
+    missing.push(pr);
+  }
+  if (!missing.length) return [];
+
   log(`без саммари ${missing.length} из ${prs.length} PR: ${missing.map((p) => "#" + p.number).join(", ")}`);
   if (dryRun || !describe) {
     log(dryRun ? "dry-run — describe не запускаю" : "--no-describe — саммари не догенерирую");
@@ -199,6 +268,7 @@ const SYSTEM_PROMPT = `Ты готовишь еженедельный дайдж
 - Объединяй мелкие правки одной темы в один пункт. Не повторяйся.
 - Каждый пункт — одно-два коротких предложения без технического жаргона. Если из данных нельзя понять пользу для пользователя, опиши изменение нейтрально и коротко.
 - Чисто технические изменения (рефакторинг, обновление зависимостей, настройка сборки, тесты) объединяй в один общий пункт в последнем разделе, без деталей.
+- Если в изменении нет кода, а только файлы (документы, картинки, PDF), опиши это по смыслу имени файла и папки: например, «обновлён документ с ответами на частые вопросы для курьеров». Если смысл неясен — одним нейтральным пунктом в последнем разделе.
 
 Правила оформления:
 - Каждый пункт начинается с одного яркого эмодзи, подходящего по смыслу (например: 🎉 ✨ 🛒 💳 📦 🔔 📊 🔍 ⚡ 🛡️ 🧹 🐞 ✅ 🚀 📱 💬 🎨 🗂️). Ровно один эмодзи в начале пункта, внутри текста эмодзи не ставь.
@@ -230,7 +300,12 @@ function buildUserPrompt(repo, prs, period) {
   prs.forEach((pr, i) => {
     lines.push(`--- Изменение ${i + 1}: ${pr.title}`);
     if (pr.labels.length) lines.push(`Метки: ${pr.labels.join(", ")}`);
-    if (pr.body) lines.push(pr.body);
+    if (pr.noCode) {
+      const list = pr.changedFiles.slice(0, 15).map((f) =>
+        `${f.path}${f.previous ? ` (было: ${f.previous})` : ""} — ${FILE_STATUS_RU[f.status] ?? f.status}`);
+      lines.push(`Изменений в коде нет. Изменены только файлы (документы/медиа/конфигурация):\n- ${list.join("\n- ")}${pr.changedFiles.length > 15 ? "\n- …" : ""}`);
+      if (pr.body) lines.push(pr.body);
+    } else if (pr.body) lines.push(pr.body);
     else if (!pr.hasSummary) lines.push("(описания нет — опирайся только на заголовок)");
     lines.push("");
   });
@@ -325,7 +400,7 @@ function generatedLine(generatedAt) {
 function prListLines(prs) {
   return prs.map((pr) =>
     `- [#${pr.number} ${pr.title}](${pr.url}) — @${pr.author}, ${fmtDate(pr.mergedAt)}` +
-    (pr.hasSummary ? "" : " _(без саммари pr-agent)_"));
+    (pr.noCode ? " _(без кода: документы/медиа)_" : pr.hasSummary ? "" : " _(без саммари pr-agent)_"));
 }
 
 // Общий файл: главное за неделю + разделы по репозиториям + свёрнутый список всех PR

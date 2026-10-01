@@ -126,6 +126,24 @@ function parseReportArgs(args) {
   return { error: "Не понял период. Варианты: /report, /report 7, /report 2026-09-14 2026-09-20 (+ force)" };
 }
 
+// Регистрируются при старте через setMyCommands — Telegram показывает их в меню «/» и подсвечивает
+// в чате. Описание ≤ 256 символов, имя — строчные латинские буквы/цифры/подчёркивание.
+const BOT_COMMANDS = [
+  { command: "report", description: "Дайджест за прошлую неделю; варианты: 7 | 2026-09-14 2026-09-20 | force" },
+  { command: "latest", description: "Прислать последний готовый дайджест" },
+  { command: "status", description: "Что отслеживается и когда был последний дайджест" },
+  { command: "help", description: "Список команд" },
+  { command: "chatid", description: "Показать id этого чата" },
+];
+
+async function registerCommands() {
+  // scope по умолчанию (all) + отдельно для групп, чтобы меню точно показывалось и там
+  await tg("setMyCommands", { commands: BOT_COMMANDS, language_code: "ru" });
+  await tg("setMyCommands", { commands: BOT_COMMANDS });
+  await tg("setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_group_chats" } });
+  await tg("setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } });
+}
+
 const HELP = [
   "<b>Команды</b>",
   "/report — дайджест за прошлую неделю (пн–вс)",
@@ -202,6 +220,12 @@ export function startTelegramBot(handlers) {
       const backlog = await tg("getUpdates", { offset: -1, timeout: 0 });
       if (backlog.length) offset = backlog[backlog.length - 1].update_id + 1;
       const me = await tg("getMe");
+      try {
+        await registerCommands();
+        log(`команды зарегистрированы в меню Telegram (${BOT_COMMANDS.map((c) => "/" + c.command).join(", ")})`);
+      } catch (err) {
+        logErr(`не удалось зарегистрировать команды: ${err.message} (бот работает, просто без меню)`);
+      }
       log(`бот @${me.username} запущен, разрешённых чатов: ${ALLOWED.size}`);
     } catch (err) {
       logErr(`не удалось запустить бота: ${err.message}`);

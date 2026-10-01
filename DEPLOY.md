@@ -72,6 +72,8 @@ PR_AGENT_LOCAL_CONFIG=pr_agent.local.openrouter.toml
 OPENROUTER_API_KEY=sk-or-...
 SUMMARY_PROVIDER=openrouter
 RELEASE_NOTES_DIR=release-notes
+TELEGRAM_BOT_TOKEN=123456:ABC...                      # если нужен бот; id чата — командой /chatid в группе
+TELEGRAM_CHAT_IDS=-1001234567890
 ```
 
 Проверка вручную от имени сервисного пользователя (dry-run ничего не пишет и модель не зовёт):

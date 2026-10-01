@@ -7,7 +7,8 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, loadEnv, parseRepos, githubJson, ymd } from "./common.mjs";
-import { runWeeklySummary, previousFullWeek } from "./weekly-summary.mjs";
+import { runWeeklySummary, previousFullWeek, lastDays, dayRange, loadLatestDigest } from "./weekly-summary.mjs";
+import { startTelegramBot, broadcastDigest, telegramEnabled, autoPostEnabled, allowedChatIds, escapeHtml } from "./telegram.mjs";
 import { runPrAgent, PR_AGENT_ARGS, BUILTIN_PR_AGENT_ARGS, LOCAL_CONFIG_NAME, checkPrAgentInstalled } from "./pr-agent.mjs";
 
 const STATE_FILE = join(ROOT, "state.json");
@@ -261,6 +262,7 @@ async function maybeRunWeeklySummary(state) {
     meta.lastWeeklySummary = key;
     delete meta.weeklyAttempts[key];
     saveState(state);
+    if (autoPostEnabled) await broadcastDigest(result.digest);
   } catch (err) {
     meta.weeklyAttempts[key] = attempts + 1;
     saveState(state);
@@ -268,12 +270,43 @@ async function maybeRunWeeklySummary(state) {
   }
 }
 
+// ---------- Telegram ----------
+function startTelegram() {
+  if (!telegramEnabled) return;
+  startTelegramBot({
+    async report({ days, from, to, force }) {
+      const period = days ? lastDays(days) : from ? dayRange(from, to) : previousFullWeek();
+      const result = await runWeeklySummary({ period, allowMissing: Boolean(force) });
+      return result.ok ? { ok: true, digest: result.digest } : { ok: false, reason: result.reason };
+    },
+    async latest() {
+      return loadLatestDigest();
+    },
+    async status() {
+      const state = loadState();
+      const lines = ["<b>PR Review Bot</b>", ""];
+      for (const r of REPO_LIST) {
+        const tracked = Object.keys(state[r.fullName] ?? {}).length;
+        lines.push(`📦 ${escapeHtml(r.fullName)} → ${escapeHtml(r.branch)}: обработано открытых PR — ${tracked}`);
+      }
+      const last = state._meta?.lastWeeklySummary;
+      lines.push("", `🗓️ Последний плановый дайджест: ${last ? "за неделю с " + last : "ещё не было"}`);
+      lines.push(`⏱️ Аптайм: ${Math.round(process.uptime() / 60)} мин, команды: ${COMMANDS.join(" → ")}`);
+      return lines.join("\n");
+    },
+  });
+}
+
 async function main() {
   const intervalMs = Number(POLL_MINUTES) * 60_000;
   checkPrAgentInstalled();
+  startTelegram();
   console.log(`PR Review Bot запущен, опрос каждые ${POLL_MINUTES} мин, команды: ${COMMANDS.join(" → ")}. Репозитории:`);
   if (AUTO_APPROVE === "true") {
     console.log(`Автоапрув: включён (ревью без замечаний${Number(AUTO_APPROVE_MAX_EFFORT) > 0 ? `, усилия ≤ ${AUTO_APPROVE_MAX_EFFORT}/5` : ""}).`);
+  }
+  if (telegramEnabled) {
+    console.log(`Telegram: бот включён, разрешённых чатов ${allowedChatIds.length}${autoPostEnabled ? ", авто-постинг недельного дайджеста включён" : ""}.`);
   }
   if (WEEKLY_SUMMARY === "true") {
     const days = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];

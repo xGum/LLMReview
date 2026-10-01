@@ -20,11 +20,12 @@
 //
 // Поллер импортирует runWeeklySummary() и вызывает его по расписанию.
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { ROOT, loadEnv, parseRepos, githubJson, ymd, pad2 } from "./common.mjs";
 import { runPrAgent } from "./pr-agent.mjs";
+import { mdToTelegramHtml, escapeHtml } from "./telegram.mjs";
 
 const env = loadEnv();
 const {
@@ -69,14 +70,14 @@ export function previousFullWeek(now = new Date()) {
   return { from, to: thisMonday };             // [from, to)
 }
 
-function lastDays(days, now = new Date()) {
+export function lastDays(days, now = new Date()) {
   const to = new Date(now);
   const from = new Date(now);
   from.setDate(from.getDate() - days);
   return { from, to };
 }
 
-function dayRange(fromYmd, toYmd) {
+export function dayRange(fromYmd, toYmd) {
   const from = new Date(`${fromYmd}T00:00:00`);
   const to = new Date(`${toYmd}T00:00:00`);
   to.setDate(to.getDate() + 1);                // включительно по дате
@@ -108,7 +109,9 @@ async function fetchMergedPRs(repo, { from, to }) {
     // значит, как только пошли PR, обновлённые раньше начала периода, дальше искать нечего
     if (new Date(batch[batch.length - 1].updated_at) < from) break;
   }
+  const seen = new Set();
   return items
+    .filter((pr) => !seen.has(pr.number) && seen.add(pr.number)) // страховка от дублей между страницами
     .filter((pr) => pr.merged_at && pr.base?.ref === repo.branch)
     .filter((pr) => { const m = new Date(pr.merged_at); return m >= from && m < to; })
     .map((pr) => ({
@@ -390,6 +393,49 @@ function repoFileNames(sections) {
   return names;
 }
 
+// ---------- текстовая версия для Telegram ----------
+// Короткая: заголовок, счётчики, «Главное за неделю» (или саммари единственного активного
+// проекта), сводка по проектам. Подробности — файлами. Формат — Telegram HTML.
+function buildTelegramText({ period, sections, overview }) {
+  const total = sections.reduce((n, s) => n + s.prs.length, 0);
+  const active = sections.filter((s) => s.prs.length);
+  const out = [];
+  out.push(`🗓️ <b>Релиз-дайджест: ${escapeHtml(humanPeriod(period))}</b>`, "");
+  if (total === 0) {
+    out.push("😴 За период смердженных изменений нет.");
+    return out.join("\n");
+  }
+  out.push(`За период смерджено <b>${total} PR</b> в ${active.length} ${plural(active.length, "проекте", "проектах", "проектах")}.`, "");
+  if (overview) {
+    out.push("🌟 <b>Главное за неделю</b>", "", mdToTelegramHtml(overview), "");
+  } else if (active.length === 1) {
+    out.push(`📦 <b>${escapeHtml(shortName(active[0].repo))}</b>`, "", mdToTelegramHtml(active[0].summary), "");
+  }
+  out.push("📦 " + sections.map((s) => `${escapeHtml(shortName(s.repo))} — ${s.prs.length} PR`).join(" · "));
+  out.push("", "📎 Подробности по каждому проекту — в файлах ниже.");
+  return out.join("\n");
+}
+
+// Последний готовый дайджест из RELEASE_NOTES_DIR (для /latest и переотправки без пересборки)
+export function loadLatestDigest(outDir) {
+  const root = resolve(ROOT, outDir || RELEASE_NOTES_DIR);
+  if (!existsSync(root)) return null;
+  const dirs = readdirSync(root)
+    .filter((d) => /^\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}$/.test(d) && statSync(join(root, d)).isDirectory())
+    .sort()
+    .reverse();
+  for (const d of dirs) {
+    const dir = join(root, d);
+    if (!existsSync(join(dir, "summary.md"))) continue;
+    const files = [join(dir, "summary.md"), ...readdirSync(dir).filter((f) => f.endsWith(".md") && f !== "summary.md").sort().map((f) => join(dir, f))];
+    const telegramText = existsSync(join(dir, "telegram.txt"))
+      ? readFileSync(join(dir, "telegram.txt"), "utf8")
+      : mdToTelegramHtml(readFileSync(join(dir, "summary.md"), "utf8"));
+    return { dir, files, telegramText };
+  }
+  return null;
+}
+
 // ---------- основной сценарий ----------
 // Возвращает { ok, reason?, file?, sections }. ok=false — отчёт не записан.
 export async function runWeeklySummary({
@@ -489,11 +535,17 @@ export async function runWeeklySummary({
   const generatedAt = new Date();
   mkdirSync(dir, { recursive: true });
   writeFileSync(file, renderGeneral({ period, generatedAt, sections, overview, repoFiles }), "utf8");
+  const repoPaths = [];
   for (const section of sections) {
-    writeFileSync(join(dir, repoFiles[section.repo.fullName]), renderRepo({ period, generatedAt, section }), "utf8");
+    const p = join(dir, repoFiles[section.repo.fullName]);
+    writeFileSync(p, renderRepo({ period, generatedAt, section }), "utf8");
+    repoPaths.push(p);
   }
-  log(`записано в ${dir}: summary.md, ${Object.values(repoFiles).join(", ")}`);
-  return { ok: true, dir, file, sections };
+  const telegramText = buildTelegramText({ period, sections, overview });
+  writeFileSync(join(dir, "telegram.txt"), telegramText, "utf8");
+  log(`записано в ${dir}: summary.md, telegram.txt, ${Object.values(repoFiles).join(", ")}`);
+  const digest = { dir, files: [file, ...repoPaths], telegramText };
+  return { ok: true, dir, file, sections, digest };
 }
 
 // ---------- CLI ----------
